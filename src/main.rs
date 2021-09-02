@@ -1,16 +1,17 @@
-use clap::{Arg, App};
 use std::fs;
+use std::io::Write;
+use std::ops::Add;
 use std::path::Path;
 use std::process;
-use calamine::{Reader, open_workbook, Xlsx};
-use serde::{Serialize, Deserialize};
-use std::io::Write;
-use hyper::{Body, Method, Request, Client};
-use base64::{encode};
+
+use base64::encode;
+use calamine::{open_workbook, Reader, Xlsx};
+use chrono::{DateTime, Utc};
+use clap::{App, Arg};
+use hyper::{Body, Client, Method, Request};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use simple_excel_writer;
-use chrono::{DateTime, Utc};
-use std::ops::Add;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Config {
@@ -18,11 +19,14 @@ struct Config {
     key: String,
     limit: i64,
     url: String,
+    company_cn: Vec<String>,
+    company_en: Vec<String>
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ListInfo {
     company: String,
+    company_code: String,
     oid: String,
     is_retry: bool,
 }
@@ -54,35 +58,9 @@ pub struct ApiData {
     pub logistic_code: String,
 }
 
-
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ApiResult {
-    #[serde(rename = "StateEx")]
-    pub state_ex: String,
-    #[serde(rename = "LogisticCode")]
-    pub logistic_code: String,
-    #[serde(rename = "ShipperCode")]
-    pub shipper_code: String,
-    #[serde(rename = "Traces")]
-    pub traces: Vec<Trace>,
-    #[serde(rename = "State")]
-    pub state: String,
-    #[serde(rename = "EBusinessID")]
-    pub ebusiness_id: String,
-    #[serde(rename = "DeliveryMan")]
-    pub delivery_man: String,
-    #[serde(rename = "DeliveryManTel")]
-    pub delivery_man_tel: String,
-    #[serde(rename = "Success")]
-    pub success: bool,
-    #[serde(rename = "Location")]
-    pub location: String,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Trace {
+pub struct TraceItem {
     #[serde(rename = "Action")]
     pub action: String,
     #[serde(rename = "AcceptStation")]
@@ -108,11 +86,18 @@ async fn main() {
             c
         },
         Err(_) => {
+            let mut company_cn = Vec::new();
+            company_cn.push(String::from("京东"));
+            let mut company_en = Vec::new();
+            company_en.push(String::from("JD"));
+
             let default: Config = Config {
                 id: String::from("未设置"),
                 key: String::from("未设置"),
                 limit: 60,
                 url: String::from("未设置"),
+                company_cn,
+                company_en
             };
 
             let default_raw = toml::to_string(&default).unwrap();
@@ -150,7 +135,7 @@ async fn main() {
 
     let file_path = matches.value_of("file").unwrap();
     let is_retry = matches.is_present("retry");
-    let row_list = read_xls(&file_path);
+    let row_list = read_xls(&file_path, &config);
 
     let all_execute_list = match is_retry {
         true => {
@@ -160,6 +145,7 @@ async fn main() {
                     list.push(ListInfo {
                         oid: row.oid,
                         company: row.company,
+                        company_code: row.company_code,
                         is_retry: false,
                     })
                 }
@@ -176,16 +162,39 @@ async fn main() {
 
     let mut start = Vec::new();
     start.push(String::from("物流公司"));
-    start.push(String::from("运单号"));
+    start.push(String::from("快递单号"));
     start.push(String::from("执行状态"));
     start.push(String::from("==="));
+    start.push(String::from("代号"));
     start.push(String::from("物流状态"));
     start.push(String::from("增值物流状态"));
     start.push(String::from("城市"));
+    start.push(String::from("==="));
+    start.push(String::from("最后更新时间"));
+    start.push(String::from("最后更新信息"));
+    start.push(String::from("最后更新位置"));
+    start.push(String::from("==="));
+    start.push(String::from("发出时间"));
+    start.push(String::from("发出信息"));
+    start.push(String::from("发出位置"));
+    start.push(String::from("派件时间"));
+    start.push(String::from("派件信息"));
+    start.push(String::from("派件位置"));
+    start.push(String::from("签收时间"));
+    start.push(String::from("签收信息"));
+    start.push(String::from("签收位置"));
+    start.push(String::from("==="));
+    start.push(String::from("问题时间"));
+    start.push(String::from("问题信息"));
+    start.push(String::from("问题位置"));
 
     rows.push(start);
 
-    for execute in &all_execute_list {
+
+    println!("总执行数据 {}", all_execute_list.len());
+
+    for (execute_index, execute) in all_execute_list.iter().enumerate() {
+        println!("正在获取 {} {}#{} 的数据", execute_index + 1, &execute.company, &execute.oid);
         let data = request_data(&execute.oid, &execute.company, &config).await;
         match data {
             None => {
@@ -194,77 +203,123 @@ async fn main() {
             Some(execute_data) => {
                 let id = (&execute.oid).parse().unwrap();
                 let company = (&execute.company).parse().unwrap();
+                let company_code = (&execute.company_code).parse().unwrap();
                 let status = String::from("1");
 
                 let mut line = Vec::new();
-                line.push(company);
+                line.push(company_code);
                 line.push(id);
                 line.push(status);
                 line.push(String::from("==="));
+                line.push(company);
 
-                //2-在途中,3-签收,4-问题件
-                line.push(match execute_data.state.as_str() {
-                    "2" => {
-                        String::from("在途中")
-                    }
-                    "3" => {
-                        String::from("签收")
-                    }
-                    "4" => {
-                        String::from("问题件")
-                    }
-                    v => {
-                        String::from("未知 ").add(&v)
-                    }
-                });
+                let state_raw = execute_data["State"].as_str().unwrap();
+                line.push(transform_code(state_raw));
 
-                // 1-已揽收， 2-在途中， 201-到达派件城市， 202-派件中， 211-已放入快递柜或驿站，
-                // 3-已签收， 311-已取出快递柜或驿站， 4-问题件， 401-发货无信息，
-                // 402-超时未签收， 403-超时未更新， 404-拒收（退件），
-                // 412-快递柜或驿站超时未取
-                line.push(match execute_data.state_ex.as_str() {
-                    "1" => {
-                        String::from("已揽收")
-                    }
-                    "2" => {
-                        String::from("在途中")
-                    }
-                    "201" => {
-                        String::from("到达派件城市")
-                    }
-                    "202" => {
-                        String::from("派件中")
-                    }
-                    "211" => {
-                        String::from("已放入快递柜或驿站")
-                    }
-                    "3" => {
-                        String::from("已签收")
-                    }
-                    "311" => {
-                        String::from("已取出快递柜或驿站")
-                    }
-                    "401" => {
-                        String::from("问题件")
-                    }
-                    "402" => {
-                        String::from("超时未签收")
-                    }
-                    "403" => {
-                        String::from("超时未更新")
-                    }
-                    "404" => {
-                        String::from("拒收（退件）")
-                    }
-                    "412" => {
-                        String::from("快递柜或驿站超时未取")
-                    }
-                    v => {
-                        String::from("未知 ").add(&v)
-                    }
-                });
+                let state_ex_raw = execute_data["StateEx"].as_str().unwrap();
+                line.push(transform_code(state_ex_raw));
 
-                line.push(execute_data.location);
+                let location_raw = execute_data["Location"].as_str();
+                match location_raw {
+                    None => {
+                        line.push(String::from(""));
+                    }
+                    Some(val) => {
+                        line.push(String::from(val));
+                    }
+                }
+
+                line.push(String::from("==="));
+
+                let traces = execute_data["Traces"].as_array();
+                match traces {
+                    None => {
+                        line.push(String::from(""));
+                        line.push(String::from(""));
+                        line.push(String::from(""));
+                        line.push(String::from(""));
+                        line.push(String::from(""));
+                        line.push(String::from(""));
+                    }
+                    Some(list) => {
+                        let last = list.last();
+                        match last {
+                            None => {
+                                line.push(String::from(""));
+                                line.push(String::from(""));
+                                line.push(String::from(""));
+                            }
+                            Some(info) => {
+                                let trace_item: TraceItem = serde_json::from_value(info.clone()).unwrap();
+
+                                line.push(trace_item.accept_time);
+                                line.push(trace_item.accept_station);
+                                line.push(trace_item.location);
+                            }
+                        }
+
+                        let send_info = find_trace_by_code(list, String::from("1"), true);
+                        match send_info {
+                            None => {
+                                line.push(String::from("==="));
+                                line.push(String::from(""));
+                                line.push(String::from(""));
+                                line.push(String::from(""));
+                            }
+                            Some(info) => {
+                                line.push(String::from("==="));
+                                line.push(info.accept_time);
+                                line.push(info.accept_station);
+                                line.push(info.location);
+                            }
+                        }
+
+                        let dispatch_info = find_trace_by_code(list, String::from("2"), false);
+                        match dispatch_info {
+                            None => {
+                                line.push(String::from(""));
+                                line.push(String::from(""));
+                                line.push(String::from(""));
+                            }
+                            Some(info) => {
+                                line.push(info.accept_time);
+                                line.push(info.accept_station);
+                                line.push(info.location);
+                            }
+                        }
+
+                        let single_info = find_trace_by_code(list, String::from("3"), false);
+                        match single_info {
+                            None => {
+                                line.push(String::from(""));
+                                line.push(String::from(""));
+                                line.push(String::from(""));
+                            }
+                            Some(info) => {
+                                line.push(info.accept_time);
+                                line.push(info.accept_station);
+                                line.push(info.location);
+                            }
+                        }
+
+
+                        let question_info = find_trace_by_code(list, String::from("4"), false);
+                        match question_info {
+                            None => {
+                                line.push(String::from("==="));
+                                line.push(String::from(""));
+                                line.push(String::from(""));
+                                line.push(String::from(""));
+                            }
+                            Some(info) => {
+                                line.push(String::from("==="));
+                                line.push(info.accept_time);
+                                line.push(info.accept_station);
+                                line.push(info.location);
+                            }
+                        }
+                    }
+                }
 
                 rows.push(line);
             }
@@ -297,6 +352,90 @@ async fn main() {
 
     let old_path = Path::new(&file_path);
     fs::write(old_path, wb_buf).unwrap();
+}
+
+fn find_trace_by_code(list: &Vec<Value>, code: String, is_first: bool) -> Option<TraceItem> {
+    let mut trace_item: Option<TraceItem> = None;
+    for item in list.iter() {
+        let action = item["Action"].as_str();
+        match action {
+            None => {
+                continue
+            }
+            Some(val) => {
+                if val.to_string().starts_with(&code) {
+                    trace_item = serde_json::from_value(item.clone()).unwrap();
+                    if is_first {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    trace_item
+}
+
+fn transform_code(code: &str) -> String {
+    match code {
+        "1" => {
+            String::from("已揽收")
+        }
+        "2" => {
+            String::from("在途中")
+        }
+        "201" => {
+            String::from("到达派件城市")
+        }
+        "202" => {
+            String::from("派件中")
+        }
+        "211" => {
+            String::from("已放入快递柜或驿站")
+        }
+        "3" => {
+            String::from("已签收")
+        }
+        "301" => {
+            String::from("正常签收")
+        }
+        "302" => {
+            String::from("代收签收")
+        }
+        "304" => {
+            String::from("快递柜或驿站签收")
+        }
+        "311" => {
+            String::from("已取出快递柜或驿站")
+        }
+        "401" => {
+            String::from("问题件")
+        }
+        "402" => {
+            String::from("超时未签收")
+        }
+        "403" => {
+            String::from("超时未更新")
+        }
+        "404" => {
+            String::from("拒收（退件）")
+        }
+        "405" => {
+            String::from("派件异常")
+        }
+        "406" => {
+            String::from("退货签收")
+        }
+        "407" => {
+            String::from("退货未签收")
+        }
+        "412" => {
+            String::from("快递柜或驿站超时未取")
+        }
+        v => {
+            String::from("未知 ").add(&v)
+        }
+    }
 }
 
 fn make_row(cells: Vec<String>) -> simple_excel_writer::Row {
@@ -341,7 +480,7 @@ fn make_req(id: &str, company: &str, config: &Config) -> Request<Body> {
     req
 }
 
-async fn request_data(id: &str, company: &str, config: &Config) -> Option<ApiResult> {
+async fn request_data(id: &str, company: &str, config: &Config) -> Option<Value> {
     let client = Client::new();
 
     let req = make_req(&id, &company, &config);
@@ -357,28 +496,44 @@ async fn request_data(id: &str, company: &str, config: &Config) -> Option<ApiRes
 
     let body_parser: Value = serde_json::from_str(&*body_str).unwrap();
 
-    let is_success = match body_parser["Success"] {
+    match body_parser["Success"] {
         Value::Bool(data) => {
-            data
+            match data {
+                true => {
+                    Some(body_parser)
+                }
+                false => {
+                    None
+                }
+            }
         }
         _ => {
             println!("ERROR {:?}", body_parser);
-            false
-        }
-    };
-
-    match is_success {
-        true => {
-            let result: ApiResult = serde_json::from_value(body_parser).unwrap();
-            Some(result)
-        }
-        false => {
             None
         }
     }
 }
 
-fn read_xls(path: &str) -> Vec<ListInfo> {
+fn convert_company(cn_name: &String, config: &Config) -> Option<String> {
+    let index = config.company_cn.iter().position(|r| r == cn_name);
+    match index {
+        None => {
+            None
+        }
+        Some(result) => {
+            match config.company_en.get(result) {
+                None => {
+                    None
+                }
+                Some(val) => {
+                    Some(val.to_string())
+                }
+            }
+        }
+    }
+}
+
+fn read_xls(path: &str, config: &Config) -> Vec<ListInfo> {
     match Path::new(&path).exists() {
         true => {
             let mut workbook: Xlsx<_> = open_workbook(path).expect(&*format!("无法读取文件 {}", &path));
@@ -389,17 +544,25 @@ fn read_xls(path: &str) -> Vec<ListInfo> {
                     if index == 0 { continue; }
                     if index == count - 1 { continue }
 
-                    let company = row.get(0).unwrap().to_string();
-                    let oid = row.get(1).unwrap().to_string();
-                    let is_retry = !(row.get(2).unwrap().is_empty());
+                    let company_raw = row.get(0).unwrap().to_string();
+                    let company = convert_company(&company_raw, &config);
+                    match company {
+                        None => {
+                            println!("当前数据转换快递公司失败 {} {}", index + 1, company_raw);
+                        }
+                        Some(company_real) => {
+                            let oid = row.get(1).unwrap().to_string();
+                            let is_retry = !(row.get(2).unwrap().is_empty());
 
-                    list.push(ListInfo {
-                        company,
-                        oid,
-                        is_retry
-                    });
+                            list.push(ListInfo {
+                                company: company_real,
+                                company_code: company_raw,
+                                oid,
+                                is_retry
+                            });
+                        }
+                    }
                 }
-                println!("快递列表总数据 {}", list.len());
                 list
             } else {
                 println!("快递列表 表一 读取失败 {}", &path);
